@@ -1,221 +1,51 @@
-# AeonG
-## Description
-AeonG is a temporal graph database that efficiently supports
-temporal features based on [Memgraph](https://memgraph.com). We provide a formally defined temporal property graph model,
-based on which we fundamentally design AeonG with a temporal-enhanced storage engine and query
-engine. AeonG utilizes a hybrid storage engine, in which we introduce a current store for maintaining
-current graphs and a historical store for storing historical graphs migrated from the current storage under
-MVCC management. Furthermore, AeonG equips a native temporal query engine to efficiently process temporal
-queries with data consistency guarantees.
+### 系统架构
 
-## Contributions
+tgdb 的系统架构如下图所示，整体由两大核心模块组成：
 
-- Fast querying capabilities over subgraphs at a past time point or range
-- Small storage overhead of historical data
-- Native support of transaction time
-- ACID compliance
+- 计算节点：负责事务调度、图操作和查询执行，包含一个读写节点与多个只读节点。
+- 存储节点：负责数据的持久化存储与管理，包含多个当前数据节点与一个历史数据节点。当前数据节点维护时态图的最新版本，而历史数据节点用于存储完整的历史版本。
 
+![`docs/tgdb.pdf`](./docs/tgdb.jpg)
 
-## Getting Started
+### 计算层实现
 
-### Build System Dependencies
-You can refer to the comprehensive documentation provided by [Memgraph](https://memgraph.notion.site/Quick-Start-82a99a85e62a4e3d89f6a9fb6d35626d) for building system dependencies. Additionally, we offer a Docker image to streamline this process. We highly recommend utilizing Docker for building AeonG.
+计算层是 tgdb 的核心执行框架，负责事务调度、图操作及查询执行。该层由一个读写节点与多个只读节点组成，两类节点均在 Memgraph 框架基础上扩展。
 
-    docker pull hououou/aeong:v1
+#### 读写节点
 
-    docker run -it -p 7687:7687 -p 7444:7444 --mount type=bind source=$pwd,target=/home/ --entrypoint bash aeong
+读写节点负责处理所有图更新与非时态查询操作。其实现基于 Memgraph 的查询执行框架。核心组件包括：
 
-### Install libraries
-Before compiling AeonG, you should activate the toolchain, which utilizes our own custom toolchain.
+- 解析器&优化器与查询执行器：继承自 Memgraph 的原生查询处理框架，负责解析 Cypher 查询语句并生成物理执行计划。
+- 当前态数据缓冲区：复用 Memgraph 的内存型存储引擎以维护最新版本数据，并融合时态数据布局机制。系统将 Memgraph 的核心结构映射至时态图模型：`Vertex` 表示顶点对象，`EdgeRef` 表示边对象，`Delta` 用于记录未回收的历史版本。每个结构均附加时间戳字段以标识版本生命周期，从而支持版本可追踪与时态一致性维护。缓冲区采用 LRU 策略进行替换管理，确保在内存受限条件下维持热点数据访问效率。
+- 日志线程：引入重做日志机制，用于记录事务执行过程中的变更操作。日志在事务提交阶段被打包并下放至存储层，以实现持久化与版本回放。
+- 通信线程：负责与存储层之间的异步交互，比如日志下放和事务提交确认。该线程周期性广播事务状态表（TST）至只读节点，用于后续只读节点的异步预取机制。
 
-    source /opt/toolchain-vXYZ/activate
+#### 只读节点
 
-Apart from the system-wide installed dependencies, AeonG needs some libraries to be built locally. The proper setup of these libraries should be checked by running the init script.
+只读节点负责处理所有时态与非时态只读查询任务，并可通过水平扩展以分担复杂时态图计算负载。其内部实现继承了 Memgraph 的查询执行框架，并集成时态处理机制。主要组件包括：
 
-    cd aeong
-     ./init
+- 时态解析器&优化器：在 Memgraph 原生解析与优化框架上扩展，以支持时态查询语言语义。具体而言，在 Cypher 语法文件中引入时间限定符，使用户能够在查询中直接指定时间点或时间区间的过滤条件；同时增强语法访问器逻辑，以识别并转换包含时态约束的查询语句，生成具有时态语义的抽象语法树。
+- 时态查询执行器：在 Memgraph 的执行引擎上集成时态算子模型与两阶段数据拉取机制，以支持时态语义的算子级执行。对核心算子 Scan 与 Expand 进行了扩展：在 `ScanAllCursor.Pull()` 中加入 `AddHistoricalVertices()` 以捕获未回收与已回收的历史顶点版本；在 `ExpandCursor.Pull()` 中引入 `AddHistoricalEdges()` 用于检索并重构历史边及其邻接顶点。通过在执行阶段融入两阶段拉取策略，系统能够在保证一致性的前提下高效访问分布式时态数据。
+- 数据缓冲区：包含当前态数据缓冲区与历史态数据缓冲区。当前态数据缓冲区与读写节点的缓冲区设计一致；历史数据缓冲区专为时态查询优化设计，通过引入两类数据结构：`HistoricalVertex` 与 `HistoricalEdge`，缓存从历史数据节点加载的历史节点和历史边版本。
+- 通信线程：与读写节点类似。此外，只读节点通过接收读写节点广播的事务状态表 TST，基于 AeonGC 的异步预取机制对本地缓冲区中的相关数据项进行及时更新。
 
-### Compile
-With all of the dependencies installed and the build environment set up, you need to configure the build system. To do that, execute the following:
+### 存储层实现
 
-    mkdir -p build
-    cd build
-    cmake ..
+存储层负责时态数据的持久化、复制与分层归档，支持高可用与低成本的长周期数据存储。该层由当前数据节点与历史数据节点构成，均基于 RocksDB 实例实现。
 
-If everything went OK, you can now, finally, run build AeonG binary and client binary.
+#### 当前数据节点
 
-    make -j$(nproc) memgraph
-    cd tests/mgbench
-    make 
+当前数据节点负责存储当前态数据。为确保低延迟与高吞吐的访问性能，这些节点部署于高性能 SSD 存储介质上，并与计算层节点处于同一局域网络中，以降低远程通信开销。其核心组件包括：
 
-### Run
+- 日志重放线程：持续从读写节点异步接收重做日志并写入本地日志队列。线程按序解析日志记录，将操作映射至对应的数据分片，实现数据的持久化。
+- 当前数据分片：采用基于哈希的分片策略对图数据进行水平划分。每个分片通过 Raft 协议维持副本一致性，以实现多节点间的数据复制与容错。
+- 通信线程：负责将日志重放过程中生成的历史数据异步传输至历史数据节点。
 
-After the compilation, you can run AeonG as follows:
+#### 历史数据节点
 
-    ./memgraph
+历史数据节点负责存储系统的历史版本数据。系统仅部署单一历史节点，其底层存储基于 RocksDB 实例构建，而 RocksDB 的文件系统通过 CatFS 挂载远端云对象存储（如 AWS S3）。其核心组件包含：
 
+- 通信线程：持续从各当前数据节点接收历史数据，并将其写入本地版本队列中等待处理。
+- 数据迁移线程：负责从版本队列中提取待归档的历史版本数据，按照 AeonG 提出的“锚点 + 增量”的数据组织模型进行重构。重组后的版本数据以压缩的键值对形式写入本地 RocksDB 实例中。
+- 历史数据与云对象存储：历史数据存储至 RocksDB 实例。RocksDB 通过 CatFS 将远端云对象存储直接挂载至本地文件系统，依托 CatFS 的缓存与增量同步机制，实现 RocksDB 文件在本地与云端之间的无缝映射，使 RocksDB 能以原生 POSIX 文件系统语义访问 COS 对象，从而在无需修改 RocksDB 源码的前提下，实现本地高速访问与云端持久化的统一。
 
-## Benchmarks
-We provide support for three temporal benchmarks to evaluate temporal performance. Additional details can be found in  [tests/benchmarks/README.md](/tests/benchmarks/README.md)
-
-* We can automatically generate graph operation query statements for generating temporal data. To do that, execute the following:
-
-        cd tests/benchmarks/$workloadname
-        python create_graph_op_quries.py --arg $arg_value
-
-* We can generate temporal query statements for evaluating temporal performance. To do that, execute the following:
-
-        cd tests/benchmarks/$workloadname
-        python create_temporal_query.py --arg $arg_value
-
-## Tools
-We provide tools for creating temporal databases and evaluating temporal database performance. These tools can be found in the [script directory](/tests/scripts/).
-
-### Create temporal database
-We provide a tool that can report the average graph operation query latency and the storage consumption of the generated temporal database. To use it, execute the following:
-
-    cd tests/scripts/
-    python3 create_temporal_database.py
-
-You can specify optional arguments to generate the desired temporal database. Check specific arguments for each workload by executing:
-
-    python create_temporal_database.py --help
-
-| Flag | Description                                                                      | 
-|----------|----------------------------------------------------------------------------------|
-|`--aeong-binary`| AeonG binary                                                                     |
-|`--client-binary`| Client binary                                                                    |
-|`--num-workers`| Number of workers                                                                |
-|`--data-directory`| Directory path where temporal database should be stored                          |
-|`--original-dataset-cypher-path`| Directory path indicating the original dataset cypher query statements           |
-|`--index-cypher-path`| Index query path                                                           |
-|`--graph-operation-cypher-path`| Directory path indicating where the graph operation query statements should be stored |
-|`--no-properties-on-edges`| Disable properties on edges                                                      |
-
-### Evaluate temporal query performance
-We provide a tool that can report the average temporal query latency.
-
-    cd tests/scripts/
-    python3 evaluate_temporal_q.py
-
-The arguments are almost the same as for `create_temporal_database.py`, except for `--temporal-query-cypher-path`, which indicates the temporal query path. You can specify optional arguments to generate the desired temporal database. Check the specific arguments for each workload by executing:
-
-    python evaluate_temporal_q.py --help
-
-## Experiments
-
-### Reproduce
-To reproduce our paper's results, please follow the steps outlined below. First, download the mgBench, LDBC, and gMark datasets. More detailed information about these datasets is available in our [benchmark](/tests/benchmarks/) directory. Additionally, our system and baseline systems can be obtained through the following Docker image.
-You need to first build our system and baseline systems, using the following scripts. Then the binary of baseline systems can be found in our Docker image at `/home/clockg[memgraph-master/aeong]/build/memgraph`.
-
-      docker pull hououou/aeong:v2
-      docker run it aeong:v2
-      cd /home/aeong[memgraph-master/clockg]
-      mkdir build
-      cmake ..
-      make -j$(nproc) memgraph
-
-
-#### AeonG vs Baseline Systems
-We provide scripts based on our benchmark generation tools and test tools to compare our system with baseline systems, Clock-G, and T-GQL. These scripts are available in the [script directory](/tests/scripts/), and you can customize them based on your needs.
-
-* For Figure 8(a), 8(b), 9(a), 9(b), 9(c), and 9(d), where `$num_op` indicates the number of graph operations, `$clockg_binary` indicates the binary path of Clock-G, and `$memgraph_binary` indicates the binary path of T-GQL.
-
-        cd tests/experiments
-        ./t_mgBench_test.sh $num_op $clockg_binary $memgraph_binary
-
-* For Figure 8(c) and 9(e), use the following script to test the LDBC workload. Note that the LDBC workload is substantial and will take a considerable amount of time.
-
-      cd tests/experiments
-      ./t_ldbc_test.sh $clockg_binary $memgraph_binary
-
-* For Figure 8(d) and 9(f), use the following script.
-
-      cd tests/experiments
-      ./t_gmark_test.sh $clockg_binary $memgraph_binary
-
-#### Performance Analysis on AeonG
-To assess the performance of AeonG, please follow the steps outlined below.
-
-* Figure 10. This experiment does not require creating a temporal database. Evaluate queries inherited from the original [mgBench](https://github.com/memgraph/memgraph/blob/master/tests/mgbench/workloads/pokec.py), [LDBC](https://github.com/ldbc/ldbc_snb_interactive_v1_impls/tree/main/cypher/queries), and [gMark](https://github.com/gbagan/gmark/tree/master/demo)  benchmarks. First, load the original datasets into each database. Then, test AeonG compared to Memgraph by specifying the database path `--data-directory`, executor binary path (either AeonG or Memgraph) `--aeong-binary`, and evaluated query path `--temporal-query-cypher-path`.
-
-      cd tests/tools/
-      python3 evaluate_temporal_q.py --data-directory $database_path --aeong-binary $binary_path(aeong/memgraph) --temporal-query-cypher-path $query_cypher_path_value 
-
-* Figure 11(a). Use the following command by specifying the database path `--data-directory`, the query path `--temporal-query-cypher-path`, and GC cycle seconds `--storage-gc-cycle-sec`.
-
-      cd tests/tools/
-      python3 evaluate_temporal_q.py --data-directory $database_path --temporal-query-cypher-path $query_cypher_path_value --storage-gc-cycle-sec $gc_interval_value
-
-
-* Figure 11(b). Evaluate the effect of the anchor number. First, create a temporal database by varying `--anchor_num`. Then, evaluate temporal query latency.
-
-      cd tests/tools/
-      python3 create_temporal_database.py --anchor_num $anchor_num_value --data-directory $data_directory
-      python3 evaluate_temporal_q.py --data-directory $data_directory
-
-* Figure 11(c). Evaluate the retention period. Create a temporal database by varying the `--retention-period-sec` and then evaluate temporal query performance.
-
-      cd tests/tools/
-      python3 create_temporal_database.py --retention-period-sec $retention_period --data-directory $data_directory
-      python3 evaluate_temporal_q.py --data-directory $data_directory
-
-* Figure 11(d). Install TiKV first, then checkout the Aeon-G branch and rebuild the project. Vary temporal data by setting `--graph-operation-cypher-path` and set different cluster nodes of TiKV.
-
-      git checkout Aeon-G
-      cd build
-      cmake ..
-      make -j$(nproc)
-      cd tests/tools/
-      python3 create_temporal_database.py --data-directory $data_directory --graph-operation-cypher-path $graph_op_path 
-      python3 evaluate_temporal_query.py --data-directory $data_directory 
-
-
-### Run AeonG manually
-You can also test AeonG performance according to your needs. We guide you with following steps:
-
-* Download dataset
-* Generate graph operation query statements. You can use generation tools in our benchmarks directory (`/benchmarks/$workload_name/create_graph_op_queries.py`).
-* Create temporal database. You can use the tool in our script directory (`/tests/scripts/create_temporal_database.py`). It will report the graph operation query latency and storage consumption.
-* Generate temporal query statements.  You can use generation tools in our benchmarks directory (`/benchmarks/$workload_name/create_temporal_query.py`).
-* Evaluate temporal performance. You can use the tool in our script directory (`/tests/scripts/evaluate_temporal_q.py`). It will report the temporal query latency.
-
-
-## AeonG Implementation
-AeonG is an extension of Memgraph. Details of our concept can be found in our [paper](https://arxiv.org/pdf/2304.12212v2/). You can also refer to Memgraph's [internal documentation](https://memgraph.notion.site/Memgraph-Internals-12b69132d67a417898972927d6870bd2) to better understand our code. We made the following major changes to support temporal features.
-
-* Storage Engine:
-  * Timestamps: Import timestamps into [Vertex](/src/storage/v2/vertex.hpp), [Edge](/src/storage/v2/edge.hpp), and [Delta](/src/storage/v2/delta.hpp) structures.
-  * Data Migration: Add data migration in the [Storage::CollectGarbage()](/src/storage/v2/storage.cpp) function to migrate unreclaimed data to RocksDB.
-  * Retain Historical Data in RocksDB: Utilize [historical_delta.cpp](/src/storage/v2/history_delta.cpp) to transfer deltas to key-value formats and store them to RocksDB.
-* Query Engine:
-  * Add Temporal Syntax in [Cypher.g4](/src/query/frontend/opencypher/grammar/Cypher.g4).
-  * Extend Scan Operator: In the
-    [ScanAllCursor.Pull()](/src/query/plan/operator.cpp) function, we introduce a function AddHistoricalVertices() to capture both unreclaimed and reclaimed historical versions.
-  * Extend scan operator:   In the
-    [ ExpandCursor.Pull()](/src/query/plan/operator.cpp) function, we introduce a function AddHistoricalEdges() to capture both unreclaimed and reclaimed historical versions.
-
-
-## Configuration settings
-We inherit the configuration settings from Memgraph, thus supporting all configurations described in Memgraph. For detailed information, please refer to this [link](https://memgraph.com/docs/configuration/configuration-settings). Additionally, AeonG supports three more configurations to provide temporal features.
-
-### General Settings
-
-| Flag | Description | 
-|----------|----------|
-|` --bolt-port`       | Port on which the Bolt server should listen.       |
-|`--data-directory`|Path to directory in which to save all permanent data.|
-| `--data-recovery-on-startup` | Facilitates recovery of one or more individual databases and their contents during startup. Replaces `--storage-recover-on-startup`|
-| `--storage-gc-cycle-sec`       | Storage garbage collector interval (in seconds).       | 
-|`--storage-recover-on-startup`| Deprecated and replaced with the `--data_recovery_on_startup` flag. Controls whether the storage recovers persisted data on startup. |
-|`--storage-properties-on-edges`| Controls whether edges have properties. |
-|`--storage-snapshot-interval-sec`| Storage snapshot creation interval (in seconds). Set to 0 to disable periodic snapshot creation. |
-|`--storage-snapshot-retention-count`| The number of snapshots that should always be kept.| 
-
-### AeonG specification
-
-| Flag | Description | Default |
-|----------|----------|----------|
-| `--retention-period-sec`       | Reclaim history period (in seconds). Set to 0 to disable reclaiming history from historical storage.       | 0       |
-| `--retention-cycle-sec`       | Reclaim history interval (in seconds).       | 60       |
-| `--anchor-num`       | Anchor number between two deltas. Set to 0 to use our multiple anchor strategies.    | 0       |
